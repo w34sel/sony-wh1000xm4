@@ -12,6 +12,8 @@ it through queues, so it never freezes while waiting for the headphones.
 from __future__ import annotations
 
 import argparse
+import base64
+import json
 import logging
 import os
 import queue
@@ -32,9 +34,79 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sonyctl as sc  # noqa: E402
+import sonyctl_tray as traymod  # noqa: E402
 
 log = sc.log
 MODES = [("nc", "Noise canceling"), ("ambient", "Ambient sound"), ("off", "Off")]
+
+# --------------------------------------------------------------------------- settings
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"))
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "sonyctl", "settings.json")
+AUTOSTART_FILE = os.path.join(CONFIG_DIR, "autostart", "sonyctl.desktop")
+
+DEFAULTS = {
+    "tray": True,                # show an icon in the system tray
+    "close_to_tray": True,       # window close button hides to the tray
+    "start_minimized": False,    # start hidden in the tray
+    "autostart": False,          # start on login (minimized)
+    "auto_connect": True,        # connect on start when the headphones are connected to this PC
+    "auto_reconnect": True,      # reconnect when they come back
+    "low_battery_notify": True,
+    "low_battery_level": 20,
+    "full_notify": True,
+    "connection_notify": False,
+    "poll_minutes": 5,
+    "tray_hint_shown": False,
+}
+
+
+def load_settings() -> dict:
+    data = dict(DEFAULTS)
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            stored = json.load(f)
+        data.update({k: v for k, v in stored.items() if k in DEFAULTS})
+    except (OSError, ValueError):
+        pass
+    data["autostart"] = os.path.exists(AUTOSTART_FILE)  # the file is the truth
+    return data
+
+
+def save_settings(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+    except OSError as e:
+        log.warning("could not save settings: %s", e)
+
+
+def launch_command() -> str:
+    if getattr(sys, "frozen", False):  # the standalone binary
+        return f'"{sys.executable}" gui --minimized'
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}" --minimized'
+
+
+def set_autostart(on: bool) -> str | None:
+    """Create or remove the login autostart entry. Returns an error message or None."""
+    try:
+        if on:
+            os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+            with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
+                f.write("[Desktop Entry]\nType=Application\nName=Sony XM4 Control\n"
+                        "Comment=Battery and noise canceling for Sony WH-1000XM4\n"
+                        f"Exec={launch_command()}\nIcon=audio-headphones\nTerminal=false\n"
+                        "X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n")
+            log.info("autostart enabled: %s", AUTOSTART_FILE)
+        elif os.path.exists(AUTOSTART_FILE):
+            os.remove(AUTOSTART_FILE)
+            log.info("autostart disabled")
+    except OSError as e:
+        return str(e)
+    return None
 
 
 # --------------------------------------------------------------------------- payload parsing
@@ -131,6 +203,16 @@ class Worker(threading.Thread):
         self.ui, self.demo, self.timeout = ui, demo, timeout
         self.cmds: queue.Queue = queue.Queue()
         self.link = None
+        # auto-reconnect: keep trying while the user wants a connection
+        self.want_connected = False
+        self.auto_reconnect = True
+        self.retry_every = 15.0
+        self.next_retry = 0.0
+        self.last_target = ("", "")
+        self.waiting_logged = False
+        # battery polling (the XM4 doesn't always report changes by itself)
+        self.poll_every = 300.0
+        self.next_poll = 0.0
 
     def submit(self, name: str, *args):
         self.cmds.put((name, args))
@@ -141,7 +223,13 @@ class Worker(threading.Thread):
     def run(self):
         while True:
             try:
-                name, args = self.cmds.get(timeout=0.25 if self.link else None)
+                if self.link:
+                    wait = 0.25
+                elif self.want_connected and self.auto_reconnect:
+                    wait = 1.0
+                else:
+                    wait = None
+                name, args = self.cmds.get(timeout=wait)
             except queue.Empty:
                 name, args = None, ()
             if name == "quit":
@@ -153,6 +241,12 @@ class Worker(threading.Thread):
                 elif self.link:
                     for f in self.link._read_some(time.monotonic() + 0.2):
                         self.handle(f)
+                    if self.link and time.monotonic() >= self.next_poll:
+                        self.next_poll = time.monotonic() + self.poll_every
+                        log.debug("periodic battery check")
+                        self.handle(self.link.request(bytes([0x10, 0x00]), expect=0x11))
+                elif self.want_connected and self.auto_reconnect and time.monotonic() >= self.next_retry:
+                    self.try_reconnect()
                 self.drain()
             except sc.LinkTimeout as e:
                 log.error("%s", e)
@@ -161,9 +255,13 @@ class Worker(threading.Thread):
                 log.error("%s", e)
                 self.post("error", msg=str(e))
             except (sc.LinkError, OSError) as e:  # connection problem: drop the link
-                log.error("%s", e)
+                if self.waiting_logged and not self.link:
+                    log.info("reconnect attempt failed: %s", e)
+                else:
+                    log.error("%s", e)
+                    self.post("error", msg=str(e))
                 self._drop()
-                self.post("error", msg=str(e))
+                self._schedule_retry()
             except Exception as e:  # keep the thread alive no matter what
                 log.exception("unexpected error in worker")
                 self.post("error", msg=f"unexpected error: {e}")
@@ -186,13 +284,36 @@ class Worker(threading.Thread):
         while self.link and self.link.inbox:
             self.handle(self.link.inbox.pop(0))
 
-    def _drop(self):
+    def _drop(self, by_user: bool = False):
         if self.link:
             try:
                 self.link.close()
             finally:
                 self.link = None
-                self.post("disconnected")
+                self.post("disconnected", by_user=by_user)
+
+    def _schedule_retry(self, delay: float | None = None):
+        if self.want_connected and self.auto_reconnect:
+            self.next_retry = time.monotonic() + (self.retry_every if delay is None else delay)
+            if not self.waiting_logged:
+                log.info("will reconnect automatically when the headphones are back")
+                self.waiting_logged = True
+            self.post("waiting")
+
+    def try_reconnect(self):
+        self.next_retry = time.monotonic() + self.retry_every
+        mac, ch = self.last_target
+        if not self.demo:
+            mac = mac.strip() or sc.auto_mac() or ""
+            if not mac:
+                return
+            # Only open the control channel when the headphones are already connected to this
+            # computer; otherwise we could pull them away from a phone they're playing on.
+            if sc.device_info(mac).get("Connected") != "yes":
+                log.debug("reconnect: %s not connected to this computer yet", mac)
+                return
+        log.info("headphones are back, reconnecting")
+        self.do_connect(mac, ch, auto=False, remember=False)
 
     def need_link(self):
         if not self.link:
@@ -200,8 +321,22 @@ class Worker(threading.Thread):
         return self.link
 
     # -- commands
-    def do_connect(self, mac: str, channel: str):
+    def do_connect(self, mac: str, channel: str, auto: bool = False, remember: bool = True):
         self._drop()
+        self.want_connected = True
+        if remember:
+            self.last_target = (mac, channel)
+        if auto and not self.demo:
+            # Started automatically: wait until the headphones are connected to this computer.
+            target = mac.strip() or sc.auto_mac()
+            if not target:
+                self.post("status", text="No paired WH-1000XM4 found")
+                self.want_connected = False
+                self.post("disconnected", by_user=True)
+                return
+            if sc.device_info(target).get("Connected") != "yes":
+                self._schedule_retry(delay=self.retry_every)
+                return
         if self.demo:
             link = FakeLink()
             name = "WH-1000XM4 (demo)"
@@ -218,6 +353,8 @@ class Worker(threading.Thread):
         link.connect()
         link.init()
         self.link = link
+        self.waiting_logged = False
+        self.next_poll = time.monotonic() + self.poll_every
         self.post("connected", name=name, mac=link.mac, channel=link.channel)
         self.do_refresh()
 
@@ -235,7 +372,17 @@ class Worker(threading.Thread):
                   source="saved channel" if ch else "channel will be found on connect")
 
     def do_disconnect(self):
-        self._drop()
+        self.want_connected = False
+        self.waiting_logged = False
+        if self.link:
+            self._drop(by_user=True)
+        else:
+            self.post("disconnected", by_user=True)
+
+    def do_configure(self, auto_reconnect: bool, poll_minutes: float):
+        self.auto_reconnect = auto_reconnect
+        self.poll_every = max(30.0, poll_minutes * 60)
+        self.next_poll = min(self.next_poll, time.monotonic() + self.poll_every)
 
     def do_refresh(self):
         link = self.need_link()
@@ -284,15 +431,25 @@ BG, CARD, FG, MUTED, ACCENT, OK, WARN, BAD = (
 
 
 class App:
-    def __init__(self, root: tk.Tk, worker: Worker, ui: queue.Queue, handler: QueueHandler, log_file):
+    def __init__(self, root: tk.Tk, worker: Worker, ui: queue.Queue, handler: QueueHandler, log_file,
+                 settings: dict | None = None):
         self.root, self.worker, self.ui, self.handler, self.log_file = root, worker, ui, handler, log_file
+        self.settings = settings if settings is not None else dict(DEFAULTS)
+        self.tray = None
+        self.visible = True
+        self.waiting = False
+        self.battery = None
+        self.charging = False
+        self.low_notified = False
+        self.full_notified = False
+        self.icon_img = None
         self.connected = False
         self.suppress = False
         self.level_job = None
 
         root.title("Sony XM4 Control")
-        root.geometry("560x720")
-        root.minsize(480, 600)
+        root.geometry("560x740")
+        root.minsize(500, 640)
         root.configure(bg=BG)
         self._style()
 
@@ -371,8 +528,11 @@ class App:
         nb.pack(fill="both", expand=True)
         logtab = ttk.Frame(nb, padding=6, style="Card.TFrame")
         rawtab = ttk.Frame(nb, padding=10, style="Card.TFrame")
+        settab = ttk.Frame(nb, padding=(12, 8), style="Card.TFrame")
+        nb.add(settab, text="Settings")
         nb.add(logtab, text="Log")
         nb.add(rawtab, text="Raw command")
+        self._build_settings(settab)
 
         tools = ttk.Frame(logtab, style="Card.TFrame")
         tools.pack(fill="x", pady=(0, 6))
@@ -411,8 +571,192 @@ class App:
         self.raw_out.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         self.set_controls(False)
-        root.protocol("WM_DELETE_WINDOW", self.quit)
+        self.set_window_icon()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<Control-q>", lambda _e: self.quit())
+        root.bind("<Escape>", lambda _e: self.on_close())
         root.after(100, self.pump)
+
+    # -- settings tab
+    def _build_settings(self, tab):
+        self.vars: dict = {}
+        self.setting_widgets = {}
+        cols = [("Tray & startup", [("tray", "Tray icon"), ("close_to_tray", "Close to tray"),
+                                     ("start_minimized", "Start minimized"), ("autostart", "Start on login"),
+                                     ("auto_connect", "Connect on start")]),
+                ("Connection & alerts", [("auto_reconnect", "Auto-reconnect"), ("low_battery_notify", "Low battery at"),
+                                         ("full_notify", "Fully charged alert"),
+                                         ("connection_notify", "Connect / disconnect alerts")])]
+        for c, (heading, rows) in enumerate(cols):
+            frame = ttk.Frame(tab, style="Card.TFrame")
+            frame.grid(row=0, column=c, sticky="nw", padx=(0, 18))
+            ttk.Label(frame, text=heading.upper(), style="CardTitle.TLabel").pack(anchor="w", pady=(0, 4))
+            for key, text in rows:
+                line = ttk.Frame(frame, style="Card.TFrame")
+                line.pack(anchor="w", pady=1)
+                v = tk.BooleanVar(value=bool(self.settings[key]))
+                self.vars[key] = v
+                w = ttk.Checkbutton(line, text=text, variable=v, style="Card.TCheckbutton",
+                                    command=lambda k=key: self.setting_changed(k))
+                w.pack(side="left")
+                self.setting_widgets[key] = w
+                if key == "low_battery_notify":
+                    self.low_level = tk.IntVar(value=int(self.settings["low_battery_level"]))
+                    sp = ttk.Spinbox(line, from_=5, to=50, increment=5, width=3, textvariable=self.low_level,
+                                     command=lambda: self.setting_changed("low_battery_level"))
+                    sp.pack(side="left", padx=(6, 2))
+                    sp.bind("<FocusOut>", lambda _e: self.setting_changed("low_battery_level"))
+                    ttk.Label(line, text="%", style="Card.TLabel").pack(side="left")
+            if c == 1:
+                line = ttk.Frame(frame, style="Card.TFrame")
+                line.pack(anchor="w", pady=(3, 0))
+                ttk.Label(line, text="Check battery every", style="Card.TLabel").pack(side="left")
+                self.poll = tk.IntVar(value=int(self.settings["poll_minutes"]))
+                sp2 = ttk.Spinbox(line, from_=1, to=60, width=3, textvariable=self.poll,
+                                  command=lambda: self.setting_changed("poll_minutes"))
+                sp2.pack(side="left", padx=6)
+                sp2.bind("<FocusOut>", lambda _e: self.setting_changed("poll_minutes"))
+                ttk.Label(line, text="min", style="Card.TLabel").pack(side="left")
+        self.tray_lbl = ttk.Label(tab, text="", style="CardMuted.TLabel", wraplength=500)
+        self.tray_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def _int(self, var, default, lo, hi):
+        try:
+            return max(lo, min(hi, int(var.get())))
+        except (tk.TclError, ValueError):
+            return default
+
+    def setting_changed(self, key):
+        for k, v in self.vars.items():
+            self.settings[k] = bool(v.get())
+        self.settings["low_battery_level"] = self._int(self.low_level, 20, 5, 50)
+        self.settings["poll_minutes"] = self._int(self.poll, 5, 1, 60)
+        if key == "autostart":
+            err = set_autostart(self.settings["autostart"])
+            if err:
+                log.error("autostart: %s", err)
+                self.settings["autostart"] = not self.settings["autostart"]
+                self.vars["autostart"].set(self.settings["autostart"])
+        if key == "tray":
+            self.start_tray()
+            if not self.settings["tray"] and not self.visible:
+                self.show_window()
+        if key in ("auto_reconnect", "poll_minutes"):
+            self.apply_worker_settings()
+        if key == "low_battery_level":
+            self.low_notified = False
+        save_settings(self.settings)
+        self.refresh_tray_label()
+
+    def apply_worker_settings(self):
+        self.worker.submit("configure", self.settings["auto_reconnect"], float(self.settings["poll_minutes"]))
+
+    # -- tray and window
+    def start_tray(self):
+        if self.tray:
+            self.tray.stop()
+        self.tray = traymod.Tray(lambda action, **kw: self.ui.put(("tray", dict(action=action, **kw))))
+        self.tray.start(register=bool(self.settings["tray"]))
+        self.push_tray_state()
+        self.refresh_tray_label()
+
+    def tray_ok(self) -> bool:
+        return bool(self.tray and self.tray.available)
+
+    def refresh_tray_label(self):
+        if self.tray_ok():
+            text = "Tray icon active. Left-click it to show/hide this window, middle-click to switch mode, " \
+                   "scroll on it to change the ambient level."
+        elif self.settings["tray"]:
+            text = f"Tray icon not available: {self.tray.reason if self.tray else 'not started'}."
+        else:
+            text = "Tray icon is off."
+        self.tray_lbl.configure(text=text)
+        tray_on = self.settings["tray"]
+        for k in ("close_to_tray", "start_minimized"):
+            self.setting_widgets[k].state(["!disabled"] if tray_on else ["disabled"])
+
+    def push_tray_state(self):
+        if self.tray:
+            self.tray.update(connected=self.connected, waiting=self.waiting, battery=self.battery,
+                             charging=self.charging, mode=self.mode.get() if self.connected else None,
+                             window_visible=self.visible, name=self.title.cget("text"))
+
+    def notify(self, summary, body="", urgency=1):
+        if self.tray:
+            self.tray.notify(summary, body, urgency)
+
+    def set_window_icon(self):
+        try:
+            png = traymod.to_png(traymod.icon_rows(48, self.battery, self.connected))
+            self.icon_img = tk.PhotoImage(data=base64.b64encode(png))
+            self.root.iconphoto(True, self.icon_img)
+        except tk.TclError as e:
+            log.debug("window icon: %s", e)
+        title = "Sony XM4 Control"
+        if self.connected and self.battery is not None:
+            title = f"Sony XM4 · {self.battery}%"
+        self.root.title(title)
+
+    def hide_window(self):
+        self.root.withdraw()
+        self.visible = False
+        self.push_tray_state()
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        self.visible = True
+        self.push_tray_state()
+
+    def toggle_window(self):
+        self.hide_window() if self.visible else self.show_window()
+
+    def ensure_visible_without_tray(self):
+        if not self.visible and not self.tray_ok():
+            log.info("no tray icon available, showing the window")
+            self.show_window()
+
+    def on_close(self):
+        if self.tray_ok() and self.settings["close_to_tray"]:
+            self.hide_window()
+            if not self.settings["tray_hint_shown"]:
+                self.notify("Still running in the tray",
+                            "Click the headphones icon to open the window. Quit from its menu.")
+                self.settings["tray_hint_shown"] = True
+                save_settings(self.settings)
+        else:
+            self.quit()
+
+    def on_tray(self, action, **kw):
+        if action in ("tray_ready", "tray_lost"):
+            if action == "tray_lost":
+                self.ensure_visible_without_tray()
+            self.push_tray_state()
+            self.refresh_tray_label()
+        elif action == "toggle_window":
+            self.toggle_window()
+        elif action == "quit":
+            self.quit()
+        elif action == "connect_toggle":
+            self.toggle_connect()
+        elif action == "mode" and self.connected:
+            self.mode.set(kw["mode"])
+            self.mode_changed()
+        elif action == "cycle_mode" and self.connected:
+            order = [m for m, _ in MODES]
+            cur = self.mode.get()
+            self.mode.set(order[(order.index(cur) + 1) % len(order)] if cur in order else "nc")
+            self.mode_changed()
+        elif action == "scroll" and self.connected and self.mode.get() == "ambient":
+            if kw.get("orientation", "vertical") == "vertical" and kw.get("delta"):
+                new = max(1, min(20, int(self.level.get()) + (1 if kw["delta"] > 0 else -1)))
+                self.level.set(new)
+                self.level_moved(new)
 
     # -- styling
     def _style(self):
@@ -477,16 +821,20 @@ class App:
 
     # -- user actions
     def toggle_connect(self):
-        if self.connected:
+        if self.connected or self.waiting:
             self.worker.submit("disconnect")
         else:
-            self.connect_btn.state(["disabled"])
-            self.set_status("Connecting…", WARN)
-            self.worker.submit("connect", self.mac.get(), self.channel.get())
+            self.start_connect(auto=False)
+
+    def start_connect(self, auto: bool):
+        self.connect_btn.state(["disabled"])
+        self.set_status("Connecting…", WARN)
+        self.worker.submit("connect", self.mac.get(), self.channel.get(), auto)
 
     def mode_changed(self):
         self.update_ambient_controls()
         self.apply_asm()
+        self.push_tray_state()
 
     def level_moved(self, _value):
         self.level_val.configure(text=str(int(float(self.level.get()))))
@@ -524,6 +872,8 @@ class App:
             log.warning("could not open %s; the full log is at that path", self.log_file)
 
     def quit(self):
+        if self.tray:
+            self.tray.stop()
         self.worker.submit("quit")
         self.root.after(150, self.root.destroy)
 
@@ -564,18 +914,38 @@ class App:
         self._fill(self.channel, channel)
         self.conn_hint.configure(text="in use")
         self.connected = True
+        self.waiting = False
         self.title.configure(text=name)
         self.set_status(f"Connected · {mac} · channel {channel}", OK)
         self.connect_btn.configure(text="Disconnect")
         self.connect_btn.state(["!disabled"])
         self.set_controls(True)
+        if self.settings["connection_notify"]:
+            self.notify("Headphones connected", name)
+        self.set_window_icon()
+        self.push_tray_state()
 
-    def on_disconnected(self):
+    def on_disconnected(self, by_user: bool = True):
+        was = self.connected
         self.connected = False
+        if by_user:
+            self.waiting = False
         self.set_status("Not connected", MUTED)
         self.connect_btn.configure(text="Connect")
         self.connect_btn.state(["!disabled"])
         self.set_controls(False)
+        if was and not by_user and self.settings["connection_notify"]:
+            self.notify("Headphones disconnected", "Will reconnect when they're back."
+                        if self.settings["auto_reconnect"] else "")
+        self.set_window_icon()
+        self.push_tray_state()
+
+    def on_waiting(self):
+        self.waiting = True
+        self.set_status("Waiting for the headphones to connect to this computer…", WARN)
+        self.connect_btn.configure(text="Stop")
+        self.connect_btn.state(["!disabled"])
+        self.push_tray_state()
 
     def on_error(self, msg):
         if not self.connected:
@@ -589,6 +959,22 @@ class App:
         self.charge_lbl.configure(text="Charging" if charging else "On battery")
         color = OK if level > 30 else WARN if level > 15 else BAD
         ttk.Style(self.root).configure("Batt.Horizontal.TProgressbar", background=color)
+        changed = (level, charging) != (self.battery, self.charging)
+        self.battery, self.charging = level, charging
+        threshold = int(self.settings["low_battery_level"])
+        if charging or level > threshold + 5:
+            self.low_notified = False
+        elif level <= threshold and not self.low_notified and self.settings["low_battery_notify"]:
+            self.notify("Headphones battery low", f"{level}% left", urgency=2)
+            self.low_notified = True
+        if not charging:
+            self.full_notified = False
+        elif level >= 100 and not self.full_notified and self.settings["full_notify"]:
+            self.notify("Headphones fully charged", "100%")
+            self.full_notified = True
+        if changed:
+            self.set_window_icon()
+            self.push_tray_state()
 
     def on_asm(self, mode, level, voice):
         self.suppress = True
@@ -600,6 +986,7 @@ class App:
             self.update_ambient_controls()
         finally:
             self.suppress = False
+        self.push_tray_state()
 
     def on_firmware(self, version):
         self.fw_lbl.configure(text=f"Firmware {version}")
@@ -615,6 +1002,8 @@ def main():
     p.add_argument("--log-file", default=sc.DEFAULT_LOG)
     p.add_argument("--no-log-file", action="store_true")
     p.add_argument("--connect", action="store_true", help="connect on start")
+    p.add_argument("--minimized", action="store_true", help="start hidden in the tray (used by autostart)")
+    p.add_argument("--no-tray", action="store_true", help="don't show a tray icon this time")
     args = p.parse_args()
 
     log_file = None if args.no_log_file else args.log_file
@@ -623,15 +1012,26 @@ def main():
     handler = QueueHandler(ui)
     log.addHandler(handler)
 
+    settings = load_settings()
+    if args.no_tray:
+        settings["tray"] = False
     worker = Worker(ui, args.demo, args.timeout)
     worker.start()
     root = tk.Tk()
-    app = App(root, worker, ui, handler, log_file)
+    app = App(root, worker, ui, handler, log_file, settings)
+    app.apply_worker_settings()
+    app.start_tray()
     log.info("sonyctl GUI %s started%s; full log: %s", sc.VERSION, " in demo mode" if args.demo else "",
              log_file or "(disabled)")
+    if (args.minimized or settings["start_minimized"]) and settings["tray"]:
+        app.hide_window()
+        # if no tray shows up (e.g. the panel isn't running), don't stay invisible
+        root.after(10000, app.ensure_visible_without_tray)
     worker.submit("detect")
     if args.connect or args.demo:
-        root.after(300, app.toggle_connect)
+        root.after(300, lambda: app.start_connect(auto=False))
+    elif settings["auto_connect"]:
+        root.after(300, lambda: app.start_connect(auto=True))
     root.mainloop()
 
 

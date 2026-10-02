@@ -48,7 +48,8 @@ The first start takes a second or two while the bundled files unpack.
 | File | Purpose |
 |---|---|
 | `sonyctl.py` | Protocol, Bluetooth link, diagnostics and the command-line tool |
-| `sonyctl_gui.py` | The Tk window (runs the link on a background thread) |
+| `sonyctl_gui.py` | The Tk window, settings, autostart, auto-reconnect (link runs on a background thread) |
+| `sonyctl_tray.py` | Tray icon + menu (StatusNotifierItem/DBusMenu) and desktop notifications over D-Bus |
 | `sonyctl_main.py` | Entry point for the binary: no args / `gui` → window, otherwise CLI |
 | `build.sh` | Builds the single-file binary with PyInstaller |
 | `install.sh` | Installs the binary to `~/.local/bin` and adds an app-menu entry |
@@ -70,6 +71,22 @@ python3 sonyctl_gui.py --connect  # connect automatically on start
 - **Log tab:** live log, with *Detail* switching between normal and raw-byte view, plus Clear / Copy (to paste to me) / Open log (opens the log folder).
 - **Raw command tab:** send any payload and see the decoded reply.
 - MAC and channel fields: leave blank to auto-detect.
+- **Settings tab** (saved in `~/.config/sonyctl/settings.json`): tray icon, close to tray, start minimized, start on login, connect on start, auto-reconnect, low-battery / fully-charged / connection alerts, battery check interval.
+
+### Tray icon
+
+A headphones icon with a small battery bar (green → amber → red) appears in your panel. Hover it for battery and mode.
+
+- **Left-click:** show or hide the window
+- **Middle-click:** switch mode (noise canceling → ambient → off)
+- **Scroll:** change the ambient sound level
+- **Right-click menu:** status, mode, connect/disconnect, show/hide, quit
+
+It uses the standard Linux tray protocol (StatusNotifierItem), so it works on KDE Plasma (and SteamOS Desktop Mode), XFCE, Cinnamon, LXQt and waybar. On GNOME, install the *AppIndicator and KStatusNotifierItem Support* extension. The binary includes everything it needs. When running from source, install `jeepney` (`sudo pacman -S python-jeepney` or `pip install --user jeepney`). Without a tray, the window simply works as before.
+
+### Start on login and auto-reconnect
+
+"Start on login" adds `~/.config/autostart/sonyctl.desktop`, which starts the app minimized to the tray. With "Connect on start" and "Auto-reconnect" turned on, the app waits until your headphones connect to the computer, then attaches to them, and does the same again after they disconnect. It never opens the control link while the headphones aren't connected to this PC, so it won't pull them away from your phone.
 
 The window needs Tk. If it says Tk is missing: on Debian/Ubuntu run `sudo apt install python3-tk`. On Arch run `sudo pacman -S tk`. On SteamOS the system folder is read-only by default, so if Tk isn't already there, use the command-line tool or ask me for a browser-based version.
 
