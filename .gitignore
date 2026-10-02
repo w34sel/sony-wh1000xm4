@@ -1,0 +1,10 @@
+# build output
+build/
+dist/
+*.spec
+.venv/
+# python
+__pycache__/
+*.pyc
+# release archives
+*.tar.gz
