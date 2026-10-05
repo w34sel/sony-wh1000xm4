@@ -132,3 +132,28 @@ Send me the log output. It shows exactly what was sent and what came back, which
 ## Status of the protocol
 
 Framing and the init/battery/mode commands follow community reverse-engineering of Sony's protocol (Gadgetbridge, SonyHeadphonesClient). The code is tested offline, but **it hasn't been run against real WH-1000XM4 headphones yet**. Expect to adjust command bytes after the first real test. `listen` and `raw` exist for exactly that. `anc wind` is experimental and may not be supported on the XM4.
+
+## Getting a release binary
+
+Releases are published by GitHub Actions — push a version tag (`git tag v0.1.0 && git push origin v0.1.0`) and a
+standalone `sonyctl-linux-x86_64.tar.gz` is built on a clean Ubuntu runner and attached to the release.
+Grab the latest from [Releases](../../releases).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, how to run the self-test, and what a good PR looks like.
+Short version: run `python3 sonyctl.py selftest` before opening anything.
+
+## Reporting a security issue
+
+See [SECURITY.md](SECURITY.md). Prefer a private Security Advisory over a public issue for unpatched findings.
+
+## Community
+
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
+- [Contributing guide](CONTRIBUTING.md)
+
+## License
+
+MIT — see [LICENSE](LICENSE).

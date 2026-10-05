@@ -1,0 +1,92 @@
+name: release
+
+# Builds the standalone x86_64 Linux binary and attaches it to a GitHub release.
+# Trigger by pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`),
+# or run manually from Actions with an optional tag input.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.1.0 (leave blank to default to v0.1.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag comes only from the (trusted) git ref name or the workflow_dispatch
+      # input. It is validated to a strict [v0-9A-Za-z.-] shape and passed through env,
+      # never interpolated inline into a shell command, so it cannot inject commands.
+      - name: Determine release tag
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then T="$INPUT_TAG"; else T="$REF_NAME"; fi
+          if [ -z "$T" ]; then T="v0.1.0"; fi
+          case "$T" in
+            v[0-9A-Za-z.]* ) : ;;
+            * ) echo "Invalid release tag: $T" >&2; exit 1 ;;
+          esac
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+
+      - name: Install Tk
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build binary
+        run: |
+          ./build.sh
+          test -x dist/sonyctl
+          ls -lh dist/sonyctl
+          file dist/sonyctl
+
+      - name: Package release archive
+        run: |
+          stage="sonyctl-release/sonyctl"
+          mkdir -p "$stage"
+          cp dist/sonyctl "$stage/sonyctl"
+          cp install.sh "$stage/install.sh"
+          chmod +x "$stage/sonyctl" "$stage/install.sh"
+          tar czf sonyctl-linux-x86_64.tar.gz -C sonyctl-release sonyctl
+          echo "Archive contents:"
+          tar tzvf sonyctl-linux-x86_64.tar.gz
+          sha256sum sonyctl-linux-x86_64.tar.gz
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        with:
+          tag_name: ${{ env.TAG }}
+          name: sonyctl ${{ env.TAG }}
+          files: sonyctl-linux-x86_64.tar.gz
+          body: |
+            Standalone **x86_64 Linux** binary — Python and Tk are bundled, nothing else to install.
+            Works on Arch/CachyOS, Ubuntu 24.04+, and SteamOS in Desktop Mode.
+
+            ```bash
+            tar xzf sonyctl-linux-x86_64.tar.gz && cd sonyctl
+            ./install.sh      # installs to ~/.local/bin and adds "Sony XM4 Control" to the app menu
+            sonyctl           # opens the window
+            ```
+
+            Any command-line command works the same as the source tool, e.g. `sonyctl battery`,
+            `sonyctl doctor`, `sonyctl gui --demo`.
+
+            See the [README](../../README.md) for full usage and diagnostics.
